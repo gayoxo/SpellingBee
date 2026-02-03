@@ -47,10 +47,11 @@ AUTO_LISTEN_CHUNK = env_int("AUTO_LISTEN_CHUNK", 6)
 
 MIN_LETTERS_VALID = env_int("MIN_LETTERS_VALID", 2)
 MIN_RELATIVE_VALID = env_float("MIN_RELATIVE_VALID", 0.35)  # 0 disables
+MAX_RELATIVE_REQUIRED = env_int("MAX_RELATIVE_REQUIRED", 8)
 
 AMBIENT_DURATION = env_float("AMBIENT_DURATION", 1.0)
 
-SCORING_MODE = os.getenv("SCORING_MODE", "position").strip().lower()
+SCORING_MODE = os.getenv("SCORING_MODE", "edit").strip().lower()  # position | edit
 PENALIZE_EXTRA = env_bool("PENALIZE_EXTRA", True)
 NO_ATTEMPT_COUNTS_AS_ROUND = env_bool("NO_ATTEMPT_COUNTS_AS_ROUND", True)
 
@@ -98,6 +99,12 @@ NOISE_WORDS = {"letter", "capital", "small", "uppercase", "lowercase"}
 
 
 def normalize_letters(text: str) -> str:
+    """
+    Convert ASR transcript to a string of letters.
+    Examples:
+      "a pee pee el ee" -> "apple"
+      "double u eye" -> "wi"
+    """
     text = (text or "").lower().replace("-", " ")
     tokens = text.split()
     result = []
@@ -125,7 +132,13 @@ def normalize_letters(text: str) -> str:
     return "".join(result)
 
 
+# ==========================
+# Scoring
+# ==========================
 def score_positionwise(target: str, guess: str) -> dict:
+    """
+    Simple per-index scoring. Can fail when there's a missing letter that shifts the rest.
+    """
     t = (target or "").lower().strip()
     g = (guess or "").lower().strip()
 
@@ -156,32 +169,144 @@ def score_positionwise(target: str, guess: str) -> dict:
     }
 
 
-def load_words(path: str) -> list[str]:
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"No existe el fichero de palabras: {p.resolve()}")
+def score_edit_distance(target: str, guess: str) -> dict:
+    """
+    Dynamic alignment using Levenshtein distance with backtrace.
+    Operations:
+      '=' match, 'S' substitution, 'I' insertion (extra in guess), 'D' deletion (missing from guess)
+    Accuracy:
+      matches / len(target)
+    """
+    t = (target or "").lower().strip()
+    g = (guess or "").lower().strip()
 
-    words = []
-    for line in p.read_text(encoding="utf-8").splitlines():
-        w = line.strip().lower()
-        if w and not w.startswith("#"):
-            words.append(w)
+    n, m = len(t), len(g)
 
-    if not words:
-        raise ValueError("El fichero de palabras está vacío (o solo contiene comentarios/líneas vacías).")
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    back = [[None] * (m + 1) for _ in range(n + 1)]
 
-    return words
+    for i in range(1, n + 1):
+        dp[i][0] = i
+        back[i][0] = ("D", i - 1, 0)
+    for j in range(1, m + 1):
+        dp[0][j] = j
+        back[0][j] = ("I", 0, j - 1)
+
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            cost_sub = 0 if t[i - 1] == g[j - 1] else 1
+
+            cand_sub = dp[i - 1][j - 1] + cost_sub
+            cand_del = dp[i - 1][j] + 1
+            cand_ins = dp[i][j - 1] + 1
+
+            best = cand_sub
+            op = "=" if cost_sub == 0 else "S"
+            prev = (i - 1, j - 1)
+
+            if cand_del < best:
+                best = cand_del
+                op = "D"
+                prev = (i - 1, j)
+
+            if cand_ins < best:
+                best = cand_ins
+                op = "I"
+                prev = (i, j - 1)
+
+            dp[i][j] = best
+            back[i][j] = (op, prev[0], prev[1])
+
+    # backtrace
+    aligned = []  # (expected_char|None, got_char|None, op)
+    i, j = n, m
+    while i > 0 or j > 0:
+        op, pi, pj = back[i][j]
+        if op in ("=", "S"):
+            aligned.append((t[i - 1], g[j - 1], op))
+        elif op == "D":
+            aligned.append((t[i - 1], None, op))
+        elif op == "I":
+            aligned.append((None, g[j - 1], op))
+        i, j = pi, pj
+    aligned.reverse()
+
+    matches = sum(1 for tc, gc, op in aligned if op == "=")
+    substitutions = sum(1 for tc, gc, op in aligned if op == "S")
+    deletions = sum(1 for tc, gc, op in aligned if op == "D")
+    insertions = sum(1 for tc, gc, op in aligned if op == "I")
+    dist = dp[n][m]
+
+    denom = max(len(t), 1)
+    accuracy = (matches / denom) * 100.0
+
+    missing_letters = "".join(tc for tc, gc, op in aligned if op == "D" and tc)
+
+    return {
+        "target": t,
+        "guess": g,
+        "accuracy": accuracy,
+        "matches": matches,
+        "denom": denom,
+        "edit_distance": dist,
+        "insertions": insertions,
+        "deletions": deletions,
+        "substitutions": substitutions,
+        "missing_letters": missing_letters,
+        "aligned": aligned,
+        "exact": (t == g),
+    }
 
 
+def format_alignment_details_edit(result: dict) -> str:
+    lines = []
+    lines.append(f"Target : {result['target']}")
+    lines.append(f"Guess  : {result['guess']}")
+    lines.append(
+        f"Edits  : dist={result['edit_distance']} "
+        f"(D={result['deletions']}, I={result['insertions']}, S={result['substitutions']})"
+    )
+    if result.get("missing_letters"):
+        lines.append(f"Missing letters: {result['missing_letters']}")
+    lines.append("")
+    lines.append("Idx | expected | got | op")
+    lines.append("-" * 26)
+
+    for idx, (tc, gc, op) in enumerate(result["aligned"]):
+        tc_disp = tc if tc is not None else "∅"
+        gc_disp = gc if gc is not None else "∅"
+        lines.append(f"{idx:02d}  |   {tc_disp}      |  {gc_disp}  | {op}")
+
+    return "\n".join(lines)
+
+
+def format_alignment_details_position(result: dict) -> str:
+    lines = []
+    lines.append(f"Target : {result['target']}")
+    lines.append(f"Guess  : {result['guess']}")
+    lines.append("")
+    lines.append("Pos | expected | got | ok")
+    lines.append("-" * 26)
+    for i, tc, gc, ok in result["per_pos"]:
+        tc_disp = tc if tc is not None else "∅"
+        gc_disp = gc if gc is not None else "∅"
+        mark = "✓" if ok else "x"
+        lines.append(f"{i:02d}  |   {tc_disp}      |  {gc_disp}  | {mark}")
+    return "\n".join(lines)
+
+
+# ==========================
+# App
+# ==========================
 class SpellingBeeApp(tk.Tk):
     def __init__(self, words_file: str):
         super().__init__()
 
-        self.title("Spelling Bee (Start + Auto Listen + Next)")
+        self.title("Spelling Bee (Start + Auto Listen + Next + Edit Alignment)")
         self.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
         self.minsize(680, 440)
 
-        self.words = load_words(words_file)
+        self.words = self._load_words(words_file)
 
         self.rounds_total = tk.IntVar(value=ROUNDS_DEFAULT)
         self.rounds_done = 0
@@ -202,6 +327,23 @@ class SpellingBeeApp(tk.Tk):
 
         self._build_ui()
         self._set_idle_screen()
+
+    # ---------- data ----------
+    def _load_words(self, path: str) -> list[str]:
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"No existe el fichero de palabras: {p.resolve()}")
+
+        words = []
+        for line in p.read_text(encoding="utf-8").splitlines():
+            w = line.strip().lower()
+            if w and not w.startswith("#"):
+                words.append(w)
+
+        if not words:
+            raise ValueError("El fichero de palabras está vacío (o solo contiene comentarios/líneas vacías).")
+
+        return words
 
     # ---------- TTS ----------
     def _try_set_english_voice(self):
@@ -230,7 +372,7 @@ class SpellingBeeApp(tk.Tk):
         top.pack(fill="x")
         ttk.Label(
             top,
-            text="Spelling Bee — Start → pronuncia → auto escucha → Siguiente",
+            text="Spelling Bee — Start → pronuncia → auto escucha → Siguiente (scoring por alineamiento)",
             font=("Segoe UI", 14, "bold")
         ).pack(anchor="w")
 
@@ -258,8 +400,8 @@ class SpellingBeeApp(tk.Tk):
 
         ttk.Label(
             word_frame,
-            text=f"Ventana de escucha: {AUTO_LISTEN_WINDOW}s (chunks de {AUTO_LISTEN_CHUNK}s). "
-                 f"Válido: ≥{MIN_LETTERS_VALID} letras y umbral relativo {MIN_RELATIVE_VALID:.2f} (0 desactiva)."
+            text=f"Ventana de escucha: {AUTO_LISTEN_WINDOW}s (chunks {AUTO_LISTEN_CHUNK}s). "
+                 f"Válido: ≥{MIN_LETTERS_VALID} letras y ≥{MIN_RELATIVE_VALID:.2f}·len(word) (máx {MAX_RELATIVE_REQUIRED})."
         ).pack(anchor="w", pady=(8, 0))
 
         res = ttk.LabelFrame(self, text="Resultado", padding=pad)
@@ -375,11 +517,15 @@ class SpellingBeeApp(tk.Tk):
     def _is_valid_attempt(self, letters: str) -> bool:
         if not letters:
             return False
+
         if len(letters) < max(1, MIN_LETTERS_VALID):
             return False
+
         if MIN_RELATIVE_VALID and MIN_RELATIVE_VALID > 0.0:
             needed = max(1, int(len(self.current_word) * MIN_RELATIVE_VALID))
+            needed = min(needed, max(1, MAX_RELATIVE_REQUIRED))
             return len(letters) >= needed
+
         return True
 
     def _start_auto_listen_window(self):
@@ -477,6 +623,11 @@ class SpellingBeeApp(tk.Tk):
 
         self._set_next_enabled(True)
 
+    def _score(self, target: str, guess: str) -> dict:
+        if SCORING_MODE == "edit":
+            return score_edit_distance(target, guess)
+        return score_positionwise(target, guess)
+
     def _handle_attempt(self, raw_text: str, letters: str):
         self.round_state = "finished"
         self._disable_controls_while_listening(False)
@@ -484,33 +635,29 @@ class SpellingBeeApp(tk.Tk):
         self.raw_var.set(f"Heard (raw): {raw_text}")
         self.norm_var.set(f"Heard (letters): {letters}")
 
-        result = score_positionwise(self.current_word, letters)
-        self.summary_var.set(
-            f"Accuracy: {result['accuracy']:.1f}%  ({result['correct_positions']}/{result['denom']} posiciones)"
-        )
+        result = self._score(self.current_word, letters)
 
-        if result["exact"]:
+        if SCORING_MODE == "edit":
+            self.summary_var.set(
+                f"Accuracy: {result['accuracy']:.1f}%  "
+                f"(matches {result['matches']}/{result['denom']}, dist={result['edit_distance']})"
+            )
+        else:
+            self.summary_var.set(
+                f"Accuracy: {result['accuracy']:.1f}%  "
+                f"({result['correct_positions']}/{result['denom']} posiciones)"
+            )
+
+        if result.get("exact"):
             self.status_var.set("✅ Perfect! Pulsa ➡️ Siguiente.")
         else:
-            msg = "⚠️ Not perfect."
-            if result["missing_suffix"]:
-                msg += f" Missing at end: '{result['missing_suffix']}'"
-            self.status_var.set(msg + "  Pulsa ➡️ Siguiente.")
+            self.status_var.set("⚠️ Not perfect. Pulsa ➡️ Siguiente.")
 
         if SHOW_DETAILS:
-            lines = [
-                f"Target : {result['target']}",
-                f"Guess  : {result['guess']}",
-                "",
-                "Pos | expected | got | ok",
-                "-" * 26,
-            ]
-            for i, tc, gc, ok in result["per_pos"]:
-                tc_disp = tc if tc is not None else "∅"
-                gc_disp = gc if gc is not None else "∅"
-                mark = "✓" if ok else "x"
-                lines.append(f"{i:02d}  |   {tc_disp}      |  {gc_disp}  | {mark}")
-            self._set_details("\n".join(lines))
+            if SCORING_MODE == "edit":
+                self._set_details(format_alignment_details_edit(result))
+            else:
+                self._set_details(format_alignment_details_position(result))
         else:
             self._set_details("")
 
