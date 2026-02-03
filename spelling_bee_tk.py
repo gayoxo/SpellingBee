@@ -42,8 +42,12 @@ ROUNDS_DEFAULT = env_int("ROUNDS_DEFAULT", 10)
 EXAM_MODE = env_bool("EXAM_MODE", True)
 SPEAK_WORD_ON_NEW_ROUND = env_bool("SPEAK_WORD_ON_NEW_ROUND", True)
 
-AUTO_LISTEN_WINDOW = env_int("AUTO_LISTEN_WINDOW", 30)   # total seconds after TTS
-AUTO_LISTEN_CHUNK = env_int("AUTO_LISTEN_CHUNK", 4)      # seconds per listen chunk
+AUTO_LISTEN_WINDOW = env_int("AUTO_LISTEN_WINDOW", 30)
+AUTO_LISTEN_CHUNK = env_int("AUTO_LISTEN_CHUNK", 4)
+
+MIN_LETTERS_VALID = env_int("MIN_LETTERS_VALID", 2)
+MIN_RELATIVE_VALID = env_float("MIN_RELATIVE_VALID", 0.6)  # 0 disables
+
 AMBIENT_DURATION = env_float("AMBIENT_DURATION", 0.8)
 
 SCORING_MODE = os.getenv("SCORING_MODE", "position").strip().lower()
@@ -60,7 +64,7 @@ TTS_VOICE_HINT = os.getenv("TTS_VOICE_HINT", "en").strip().lower()
 
 
 # ==========================
-# Spelling: letters mode
+# Letters normalization
 # ==========================
 LETTER_MAP = {
     "a": "a", "ay": "a",
@@ -176,7 +180,7 @@ class SpellingBeeApp(tk.Tk):
     def __init__(self, words_file: str):
         super().__init__()
 
-        self.title("Spelling Bee (Auto Listen)")
+        self.title("Spelling Bee (Auto Listen + Next)")
         self.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
         self.minsize(680, 440)
 
@@ -197,8 +201,11 @@ class SpellingBeeApp(tk.Tk):
         self._listening_thread = None
         self._stop_listening = threading.Event()
 
+        # Estado de ronda: mientras escucha o esperando “Siguiente”
+        self.round_state = "idle"  # idle | listening | finished
+
         self._build_ui()
-        self.new_round()
+        self.start_new_round()
 
     # ---------- TTS ----------
     def _try_set_english_voice(self):
@@ -227,7 +234,7 @@ class SpellingBeeApp(tk.Tk):
         top.pack(fill="x")
         ttk.Label(
             top,
-            text="Spelling Bee — auto escucha tras pronunciar la palabra",
+            text="Spelling Bee — pronuncia + auto escucha + botón Siguiente",
             font=("Segoe UI", 14, "bold")
         ).pack(anchor="w")
 
@@ -238,14 +245,11 @@ class SpellingBeeApp(tk.Tk):
         self.rounds_spin = ttk.Spinbox(conf, from_=1, to=50, textvariable=self.rounds_total, width=6)
         self.rounds_spin.grid(row=0, column=1, sticky="w", padx=(6, 18))
 
-        self.btn_new = ttk.Button(conf, text="Nueva palabra", command=self.new_round)
-        self.btn_new.grid(row=0, column=2, padx=6)
-
         self.btn_speak = ttk.Button(conf, text="🔊 Repetir palabra", command=lambda: self.speak_word(self.current_word))
-        self.btn_speak.grid(row=0, column=3, padx=6)
+        self.btn_speak.grid(row=0, column=2, padx=6)
 
         self.btn_reset = ttk.Button(conf, text="Reset", command=self.reset_game)
-        self.btn_reset.grid(row=0, column=4, padx=6)
+        self.btn_reset.grid(row=0, column=3, padx=6)
 
         word_frame = ttk.LabelFrame(self, text="Palabra / Audio", padding=pad)
         word_frame.pack(fill="x", padx=pad, pady=(0, pad))
@@ -255,7 +259,8 @@ class SpellingBeeApp(tk.Tk):
 
         ttk.Label(
             word_frame,
-            text=f"Tras pronunciar la palabra, la app escucha {AUTO_LISTEN_WINDOW}s. Deletrea: “A P P L E”, “double u”, “zee/zed”…"
+            text=f"Tras pronunciar la palabra, la app escucha {AUTO_LISTEN_WINDOW}s. "
+                 f"Deletreo válido: ≥{MIN_LETTERS_VALID} letras y umbral relativo {MIN_RELATIVE_VALID:.2f} (0 desactiva)."
         ).pack(anchor="w", pady=(8, 0))
 
         res = ttk.LabelFrame(self, text="Resultado", padding=pad)
@@ -282,8 +287,13 @@ class SpellingBeeApp(tk.Tk):
         self.progress_var = tk.StringVar(value="Ronda: 0/0 | Media: 0.0%")
         ttk.Label(footer, textvariable=self.progress_var).pack(side="left")
 
+        self.btn_next = ttk.Button(footer, text="➡️ Siguiente", command=self.on_next)
+        self.btn_next.pack(side="right", padx=(6, 0))
+
         self.btn_finish = ttk.Button(footer, text="Finalizar", command=self.finish_game)
         self.btn_finish.pack(side="right")
+
+        self._set_next_enabled(False)
 
     def _set_details(self, text: str):
         self.details.configure(state="normal")
@@ -302,52 +312,57 @@ class SpellingBeeApp(tk.Tk):
         else:
             self.word_var.set("🔊 Listen and spell (auto listening)")
 
-    def _disable_controls(self, disabled: bool):
-        state = "disabled" if disabled else "normal"
-        self.btn_new.config(state=state)
-        self.btn_reset.config(state=state)
-        self.btn_speak.config(state=state)
-        self.rounds_spin.config(state=state)
-        self.btn_finish.config(state=state)
+    def _set_next_enabled(self, enabled: bool):
+        self.btn_next.config(state=("normal" if enabled else "disabled"))
+
+    def _disable_controls_while_listening(self, listening: bool):
+        # Durante la escucha bloqueamos cambios de ronda y fin/next
+        state_other = "disabled" if listening else "normal"
+        self.rounds_spin.config(state=state_other)
+        self.btn_reset.config(state=state_other)
+        self.btn_finish.config(state=state_other)
+        self.btn_speak.config(state=state_other)
+        # Next sólo se habilita al finalizar la ronda
+        if listening:
+            self._set_next_enabled(False)
 
     # ---------- Speech to text ----------
     def _listen_google_en_chunk(self) -> str:
-        """
-        Listen a short chunk and transcribe with Google (needs internet).
-        Uses phrase_time_limit=AUTO_LISTEN_CHUNK
-        """
         with sr.Microphone() as source:
             self.recognizer.adjust_for_ambient_noise(source, duration=AMBIENT_DURATION)
             audio = self.recognizer.listen(source, phrase_time_limit=AUTO_LISTEN_CHUNK)
         return self.recognizer.recognize_google(audio, language="en-US").lower()
 
+    def _is_valid_attempt(self, letters: str) -> bool:
+        if not letters:
+            return False
+        if len(letters) < max(1, MIN_LETTERS_VALID):
+            return False
+        if MIN_RELATIVE_VALID and MIN_RELATIVE_VALID > 0.0:
+            needed = max(1, int(len(self.current_word) * MIN_RELATIVE_VALID))
+            return len(letters) >= needed
+        return True
+
     def _start_auto_listen_window(self):
-        """
-        Runs in a background thread:
-        - tries to capture a valid spelling within AUTO_LISTEN_WINDOW seconds
-        - if found -> evaluate
-        - else -> no attempt
-        """
         self._stop_listening.clear()
         deadline = time.time() + max(1, AUTO_LISTEN_WINDOW)
 
         last_raw = None
+        last_letters = None
+
         while time.time() < deadline and not self._stop_listening.is_set():
             try:
                 raw = self._listen_google_en_chunk()
-                last_raw = raw
                 letters = normalize_letters(raw)
+                last_raw, last_letters = raw, letters
 
-                # "valid spelling": at least 2 letters (evita falsos positivos tipo "a")
-                if len(letters) >= 2:
+                if self._is_valid_attempt(letters):
                     self.after(0, lambda r=raw, l=letters: self._handle_attempt(r, l))
                     return
                 else:
-                    # update UI feedback (optional)
                     self.after(0, lambda r=raw, l=letters: self._update_heard_preview(r, l))
 
             except sr.UnknownValueError:
-                # nothing understandable in this chunk; continue
                 continue
             except sr.RequestError as e:
                 self.after(0, lambda: self._handle_stt_error(f"Error del servicio de reconocimiento:\n{e}"))
@@ -356,8 +371,7 @@ class SpellingBeeApp(tk.Tk):
                 self.after(0, lambda: self._handle_stt_error(f"Error inesperado:\n{e}"))
                 return
 
-        # time out without valid spelling
-        self.after(0, lambda r=last_raw: self._handle_no_attempt(r))
+        self.after(0, lambda r=last_raw, l=last_letters: self._handle_no_attempt(r, l))
 
     def _update_heard_preview(self, raw: str, letters: str):
         self.raw_var.set(f"Heard (raw): {raw}")
@@ -365,9 +379,11 @@ class SpellingBeeApp(tk.Tk):
         self.summary_var.set("Accuracy: - (listening...)")
 
     def _handle_stt_error(self, msg: str):
-        self._disable_controls(False)
+        self.round_state = "finished"
+        self._disable_controls_while_listening(False)
         messagebox.showerror("STT Error", msg)
-        self.status_var.set("🌐 Error STT. Pulsa Nueva palabra para continuar.")
+        self.status_var.set("🌐 Error STT. Pulsa ➡️ Siguiente para continuar.")
+        self._set_next_enabled(True)
 
     # ---------- Round lifecycle ----------
     def reset_game(self):
@@ -379,19 +395,28 @@ class SpellingBeeApp(tk.Tk):
         self.summary_var.set("Accuracy: -")
         self.status_var.set("Juego reiniciado.")
         self._set_details("")
-        self.new_round()
+        self._update_progress()
+        self.start_new_round()
 
-    def new_round(self):
-        # stop any previous listening thread (best effort)
+    def start_new_round(self):
+        # Stop prior listening (best effort)
         self._stop_listening.set()
 
+        # Nueva palabra
         self.current_word = random.choice(self.words)
         self._update_word_display()
         self._update_progress()
+
+        # Reset UI
         self.raw_var.set("Heard (raw): -")
         self.norm_var.set("Heard (letters): -")
         self.summary_var.set("Accuracy: -")
         self._set_details("")
+        self._set_next_enabled(False)
+
+        # TTS + listening
+        self.round_state = "listening"
+        self._disable_controls_while_listening(True)
 
         self.status_var.set("🔊 Pronunciando palabra…")
         self.update_idletasks()
@@ -400,35 +425,39 @@ class SpellingBeeApp(tk.Tk):
             self.speak_word(self.current_word)
 
         self.status_var.set(f"🎙️ Escuchando hasta {AUTO_LISTEN_WINDOW}s… (deletrea ahora)")
-        self._disable_controls(True)
+        t = threading.Thread(target=self._start_auto_listen_window, daemon=True)
+        self._listening_thread = t
+        t.start()
 
-        # start listening in background
-        self._listening_thread = threading.Thread(target=self._start_auto_listen_window, daemon=True)
-        self._listening_thread.start()
-
-    def _handle_no_attempt(self, raw_last: str | None):
-        self._disable_controls(False)
+    def _handle_no_attempt(self, raw_last: str | None, letters_last: str | None):
+        # Finaliza la ronda sin avanzar
+        self.round_state = "finished"
+        self._disable_controls_while_listening(False)
 
         if raw_last:
             self.raw_var.set(f"Heard (raw): {raw_last}")
-            self.norm_var.set("Heard (letters): (no valid spelling)")
         else:
             self.raw_var.set("Heard (raw): -")
-            self.norm_var.set("Heard (letters): (no audio detected)")
+
+        if letters_last:
+            self.norm_var.set(f"Heard (letters): {letters_last} (not valid)")
+        else:
+            self.norm_var.set("Heard (letters): (no valid spelling)")
 
         self.summary_var.set("Accuracy: 0.0% (no attempt)")
         self.status_var.set("⏱️ Tiempo agotado: no se detectó deletreo válido.")
 
         if NO_ATTEMPT_COUNTS_AS_ROUND:
-            # count as 0% round
             self.rounds_done += 1
             self.score_sum += 0.0
             self._update_progress()
-            self._advance_or_finish()
+
+        self._set_next_enabled(True)
 
     def _handle_attempt(self, raw_text: str, letters: str):
-        # Called in UI thread (via after)
-        self._disable_controls(False)
+        # Finaliza la ronda y espera “Siguiente”
+        self.round_state = "finished"
+        self._disable_controls_while_listening(False)
 
         self.raw_var.set(f"Heard (raw): {raw_text}")
         self.norm_var.set(f"Heard (letters): {letters}")
@@ -439,12 +468,12 @@ class SpellingBeeApp(tk.Tk):
         )
 
         if result["exact"]:
-            self.status_var.set("✅ Perfect!")
+            self.status_var.set("✅ Perfect! Pulsa ➡️ Siguiente.")
         else:
             msg = "⚠️ Not perfect."
             if result["missing_suffix"]:
                 msg += f" Missing at end: '{result['missing_suffix']}'"
-            self.status_var.set(msg)
+            self.status_var.set(msg + "  Pulsa ➡️ Siguiente.")
 
         if SHOW_DETAILS:
             lines = [
@@ -460,19 +489,27 @@ class SpellingBeeApp(tk.Tk):
                 mark = "✓" if ok else "x"
                 lines.append(f"{i:02d}  |   {tc_disp}      |  {gc_disp}  | {mark}")
             self._set_details("\n".join(lines))
+        else:
+            self._set_details("")
 
-        # update global
+        # update global score
         self.rounds_done += 1
         self.score_sum += float(result["accuracy"])
         self._update_progress()
-        self._advance_or_finish()
 
-    def _advance_or_finish(self):
+        self._set_next_enabled(True)
+
+    def on_next(self):
+        # Sólo permitir si la ronda está finalizada
+        if self.round_state != "finished":
+            return
+
         total = int(self.rounds_total.get())
         if self.rounds_done >= total:
             self.finish_game(auto=True)
-        else:
-            self.new_round()
+            return
+
+        self.start_new_round()
 
     def finish_game(self, auto: bool = False):
         self._stop_listening.set()
@@ -481,14 +518,12 @@ class SpellingBeeApp(tk.Tk):
         if self.rounds_done == 0:
             messagebox.showinfo("Resultado", "Aún no has completado ninguna ronda.")
             return
+
         avg = self.score_sum / self.rounds_done
         title = "Rondas completadas" if auto else "Finalizado"
         messagebox.showinfo(title, f"Rondas: {self.rounds_done}/{total}\nMedia final: {avg:.1f}%")
 
 
-# ==========================
-# Main
-# ==========================
 if __name__ == "__main__":
     try:
         app = SpellingBeeApp(words_file=WORDS_FILE)
