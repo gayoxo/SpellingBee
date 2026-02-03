@@ -1,5 +1,7 @@
 import os
 import random
+import time
+import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 from pathlib import Path
@@ -35,34 +37,30 @@ def env_float(key: str, default: float) -> float:
 # Config from .env
 # ==========================
 WORDS_FILE = os.getenv("WORDS_FILE", "words.txt")
-
 ROUNDS_DEFAULT = env_int("ROUNDS_DEFAULT", 10)
 
-# Exam mode: do not show the word; speak it in English
 EXAM_MODE = env_bool("EXAM_MODE", True)
 SPEAK_WORD_ON_NEW_ROUND = env_bool("SPEAK_WORD_ON_NEW_ROUND", True)
 
-# Audio recording parameters (speech to text)
-LISTEN_TIME_LIMIT = env_int("LISTEN_TIME_LIMIT", 6)
-AMBIENT_DURATION = env_float("AMBIENT_DURATION", 0.6)
+AUTO_LISTEN_WINDOW = env_int("AUTO_LISTEN_WINDOW", 30)   # total seconds after TTS
+AUTO_LISTEN_CHUNK = env_int("AUTO_LISTEN_CHUNK", 4)      # seconds per listen chunk
+AMBIENT_DURATION = env_float("AMBIENT_DURATION", 0.8)
 
-# UI
+SCORING_MODE = os.getenv("SCORING_MODE", "position").strip().lower()
+PENALIZE_EXTRA = env_bool("PENALIZE_EXTRA", True)
+NO_ATTEMPT_COUNTS_AS_ROUND = env_bool("NO_ATTEMPT_COUNTS_AS_ROUND", True)
+
 WINDOW_WIDTH = env_int("WINDOW_WIDTH", 760)
 WINDOW_HEIGHT = env_int("WINDOW_HEIGHT", 520)
 SHOW_DETAILS = env_bool("SHOW_DETAILS", True)
 
-# Scoring
-SCORING_MODE = os.getenv("SCORING_MODE", "position").strip().lower()   # position | (future)
-PENALIZE_EXTRA = env_bool("PENALIZE_EXTRA", True)
-
-# TTS (Text-to-Speech)
-TTS_RATE = env_int("TTS_RATE", 170)
+TTS_RATE = env_int("TTS_RATE", 130)
 TTS_VOLUME = env_float("TTS_VOLUME", 1.0)
-TTS_VOICE_HINT = os.getenv("TTS_VOICE_HINT", "en").strip().lower()  # try "en"
+TTS_VOICE_HINT = os.getenv("TTS_VOICE_HINT", "en").strip().lower()
 
 
 # ==========================
-# Spelling: letters mode (normalization)
+# Spelling: letters mode
 # ==========================
 LETTER_MAP = {
     "a": "a", "ay": "a",
@@ -92,16 +90,10 @@ LETTER_MAP = {
     "y": "y", "why": "y",
     "z": "z", "zee": "z", "zed": "z",
 }
-
 NOISE_WORDS = {"letter", "capital", "small", "uppercase", "lowercase"}
 
 
 def normalize_letters(text: str) -> str:
-    """
-    Convert ASR transcript to letters string. Examples:
-      "a pee pee el ee" -> "apple"
-      "double u eye" -> "wi"
-    """
     text = (text or "").lower().replace("-", " ")
     tokens = text.split()
     result = []
@@ -130,14 +122,6 @@ def normalize_letters(text: str) -> str:
 
 
 def score_positionwise(target: str, guess: str) -> dict:
-    """
-    Position-wise score:
-      correct_positions = count matches by index
-      accuracy = correct_positions / denom
-    denom:
-      - if PENALIZE_EXTRA: denom = max(len(target), len(guess))
-      - else denom = len(target)  (extra letters do not reduce denom)
-    """
     t = (target or "").lower().strip()
     g = (guess or "").lower().strip()
 
@@ -192,59 +176,47 @@ class SpellingBeeApp(tk.Tk):
     def __init__(self, words_file: str):
         super().__init__()
 
-        self.title("Spelling Bee (Voice Letters)")
+        self.title("Spelling Bee (Auto Listen)")
         self.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
         self.minsize(680, 440)
 
         self.words = load_words(words_file)
 
-        # Game state
         self.rounds_total = tk.IntVar(value=ROUNDS_DEFAULT)
         self.rounds_done = 0
         self.score_sum = 0.0
         self.current_word = ""
 
-        # Speech-to-text
         self.recognizer = sr.Recognizer()
 
-        # TTS (offline)
         self.tts = pyttsx3.init()
         self.tts.setProperty("rate", TTS_RATE)
         self.tts.setProperty("volume", TTS_VOLUME)
         self._try_set_english_voice()
+
+        self._listening_thread = None
+        self._stop_listening = threading.Event()
 
         self._build_ui()
         self.new_round()
 
     # ---------- TTS ----------
     def _try_set_english_voice(self):
-        """
-        Best-effort: pick a voice that includes 'en' (or your hint) in its id/name.
-        If none found, keep default system voice.
-        """
         try:
             voices = self.tts.getProperty("voices") or []
-            chosen = None
             for v in voices:
                 blob = f"{getattr(v, 'id', '')} {getattr(v, 'name', '')}".lower()
                 if TTS_VOICE_HINT and TTS_VOICE_HINT in blob:
-                    chosen = v.id
+                    self.tts.setProperty("voice", v.id)
                     break
-            if chosen:
-                self.tts.setProperty("voice", chosen)
         except Exception:
             pass
 
     def speak_word(self, word: str):
-        """
-        Speak a word using offline TTS. Non-blocking would be nicer,
-        but for simplicity we keep it blocking (short utterances).
-        """
         try:
             self.tts.say(word)
             self.tts.runAndWait()
         except Exception:
-            # Do not break the game if TTS fails
             pass
 
     # ---------- UI ----------
@@ -255,7 +227,7 @@ class SpellingBeeApp(tk.Tk):
         top.pack(fill="x")
         ttk.Label(
             top,
-            text="Spelling Bee — modo letras por micrófono",
+            text="Spelling Bee — auto escucha tras pronunciar la palabra",
             font=("Segoe UI", 14, "bold")
         ).pack(anchor="w")
 
@@ -269,34 +241,27 @@ class SpellingBeeApp(tk.Tk):
         self.btn_new = ttk.Button(conf, text="Nueva palabra", command=self.new_round)
         self.btn_new.grid(row=0, column=2, padx=6)
 
-        self.btn_listen = ttk.Button(conf, text="🎙️ Escuchar", command=self.listen_and_check)
-        self.btn_listen.grid(row=0, column=3, padx=6)
-
-        self.btn_repeat = ttk.Button(conf, text="Repetir (no cuenta)", command=self.repeat_listen_no_score)
-        self.btn_repeat.grid(row=0, column=4, padx=6)
-
         self.btn_speak = ttk.Button(conf, text="🔊 Repetir palabra", command=lambda: self.speak_word(self.current_word))
-        self.btn_speak.grid(row=0, column=5, padx=6)
+        self.btn_speak.grid(row=0, column=3, padx=6)
 
         self.btn_reset = ttk.Button(conf, text="Reset", command=self.reset_game)
-        self.btn_reset.grid(row=0, column=6, padx=6)
+        self.btn_reset.grid(row=0, column=4, padx=6)
 
         word_frame = ttk.LabelFrame(self, text="Palabra / Audio", padding=pad)
         word_frame.pack(fill="x", padx=pad, pady=(0, pad))
 
         self.word_var = tk.StringVar(value="")
-        self.word_label = ttk.Label(word_frame, textvariable=self.word_var, font=("Consolas", 22, "bold"))
-        self.word_label.pack(anchor="center")
+        ttk.Label(word_frame, textvariable=self.word_var, font=("Consolas", 22, "bold")).pack(anchor="center")
 
         ttk.Label(
             word_frame,
-            text="Deletrea diciendo letras en inglés separadas: “A P P L E”, “double u”, “zee/zed”…"
+            text=f"Tras pronunciar la palabra, la app escucha {AUTO_LISTEN_WINDOW}s. Deletrea: “A P P L E”, “double u”, “zee/zed”…"
         ).pack(anchor="w", pady=(8, 0))
 
         res = ttk.LabelFrame(self, text="Resultado", padding=pad)
         res.pack(fill="both", expand=True, padx=pad, pady=(0, pad))
 
-        self.status_var = tk.StringVar(value="Pulsa 🎙️ Escuchar para deletrear.")
+        self.status_var = tk.StringVar(value="Iniciando…")
         ttk.Label(res, textvariable=self.status_var, font=("Segoe UI", 11, "bold")).pack(anchor="w")
 
         self.raw_var = tk.StringVar(value="Heard (raw): -")
@@ -320,8 +285,93 @@ class SpellingBeeApp(tk.Tk):
         self.btn_finish = ttk.Button(footer, text="Finalizar", command=self.finish_game)
         self.btn_finish.pack(side="right")
 
-    # ---------- Game logic ----------
+    def _set_details(self, text: str):
+        self.details.configure(state="normal")
+        self.details.delete("1.0", "end")
+        self.details.insert("1.0", text)
+        self.details.configure(state="disabled")
+
+    def _update_progress(self):
+        total = int(self.rounds_total.get())
+        avg = (self.score_sum / self.rounds_done) if self.rounds_done else 0.0
+        self.progress_var.set(f"Ronda: {self.rounds_done}/{total} | Media: {avg:.1f}%")
+
+    def _update_word_display(self):
+        if not EXAM_MODE:
+            self.word_var.set(self.current_word)
+        else:
+            self.word_var.set("🔊 Listen and spell (auto listening)")
+
+    def _disable_controls(self, disabled: bool):
+        state = "disabled" if disabled else "normal"
+        self.btn_new.config(state=state)
+        self.btn_reset.config(state=state)
+        self.btn_speak.config(state=state)
+        self.rounds_spin.config(state=state)
+        self.btn_finish.config(state=state)
+
+    # ---------- Speech to text ----------
+    def _listen_google_en_chunk(self) -> str:
+        """
+        Listen a short chunk and transcribe with Google (needs internet).
+        Uses phrase_time_limit=AUTO_LISTEN_CHUNK
+        """
+        with sr.Microphone() as source:
+            self.recognizer.adjust_for_ambient_noise(source, duration=AMBIENT_DURATION)
+            audio = self.recognizer.listen(source, phrase_time_limit=AUTO_LISTEN_CHUNK)
+        return self.recognizer.recognize_google(audio, language="en-US").lower()
+
+    def _start_auto_listen_window(self):
+        """
+        Runs in a background thread:
+        - tries to capture a valid spelling within AUTO_LISTEN_WINDOW seconds
+        - if found -> evaluate
+        - else -> no attempt
+        """
+        self._stop_listening.clear()
+        deadline = time.time() + max(1, AUTO_LISTEN_WINDOW)
+
+        last_raw = None
+        while time.time() < deadline and not self._stop_listening.is_set():
+            try:
+                raw = self._listen_google_en_chunk()
+                last_raw = raw
+                letters = normalize_letters(raw)
+
+                # "valid spelling": at least 2 letters (evita falsos positivos tipo "a")
+                if len(letters) >= 2:
+                    self.after(0, lambda r=raw, l=letters: self._handle_attempt(r, l))
+                    return
+                else:
+                    # update UI feedback (optional)
+                    self.after(0, lambda r=raw, l=letters: self._update_heard_preview(r, l))
+
+            except sr.UnknownValueError:
+                # nothing understandable in this chunk; continue
+                continue
+            except sr.RequestError as e:
+                self.after(0, lambda: self._handle_stt_error(f"Error del servicio de reconocimiento:\n{e}"))
+                return
+            except Exception as e:
+                self.after(0, lambda: self._handle_stt_error(f"Error inesperado:\n{e}"))
+                return
+
+        # time out without valid spelling
+        self.after(0, lambda r=last_raw: self._handle_no_attempt(r))
+
+    def _update_heard_preview(self, raw: str, letters: str):
+        self.raw_var.set(f"Heard (raw): {raw}")
+        self.norm_var.set(f"Heard (letters): {letters if letters else '(vacío)'}")
+        self.summary_var.set("Accuracy: - (listening...)")
+
+    def _handle_stt_error(self, msg: str):
+        self._disable_controls(False)
+        messagebox.showerror("STT Error", msg)
+        self.status_var.set("🌐 Error STT. Pulsa Nueva palabra para continuar.")
+
+    # ---------- Round lifecycle ----------
     def reset_game(self):
+        self._stop_listening.set()
         self.rounds_done = 0
         self.score_sum = 0.0
         self.raw_var.set("Heard (raw): -")
@@ -332,131 +382,60 @@ class SpellingBeeApp(tk.Tk):
         self.new_round()
 
     def new_round(self):
+        # stop any previous listening thread (best effort)
+        self._stop_listening.set()
+
         self.current_word = random.choice(self.words)
         self._update_word_display()
+        self._update_progress()
+        self.raw_var.set("Heard (raw): -")
+        self.norm_var.set("Heard (letters): -")
+        self.summary_var.set("Accuracy: -")
+        self._set_details("")
 
-        # In exam mode, the hint is the spoken word
-        if EXAM_MODE and SPEAK_WORD_ON_NEW_ROUND:
+        self.status_var.set("🔊 Pronunciando palabra…")
+        self.update_idletasks()
+
+        if SPEAK_WORD_ON_NEW_ROUND:
             self.speak_word(self.current_word)
 
-        self.status_var.set("Pulsa 🎙️ Escuchar y deletrea la palabra letra a letra.")
-        self._update_progress()
+        self.status_var.set(f"🎙️ Escuchando hasta {AUTO_LISTEN_WINDOW}s… (deletrea ahora)")
+        self._disable_controls(True)
 
-    def _update_word_display(self):
-        if not EXAM_MODE:
-            self.word_var.set(self.current_word)
+        # start listening in background
+        self._listening_thread = threading.Thread(target=self._start_auto_listen_window, daemon=True)
+        self._listening_thread.start()
+
+    def _handle_no_attempt(self, raw_last: str | None):
+        self._disable_controls(False)
+
+        if raw_last:
+            self.raw_var.set(f"Heard (raw): {raw_last}")
+            self.norm_var.set("Heard (letters): (no valid spelling)")
         else:
-            # Exam mode: do not show the word
-            self.word_var.set("🔊 Listen and spell (voice letters)")
+            self.raw_var.set("Heard (raw): -")
+            self.norm_var.set("Heard (letters): (no audio detected)")
 
-    def _update_progress(self):
-        total = int(self.rounds_total.get())
-        avg = (self.score_sum / self.rounds_done) if self.rounds_done else 0.0
-        self.progress_var.set(f"Ronda: {self.rounds_done}/{total} | Media: {avg:.1f}%")
+        self.summary_var.set("Accuracy: 0.0% (no attempt)")
+        self.status_var.set("⏱️ Tiempo agotado: no se detectó deletreo válido.")
 
-    def _set_details(self, text: str):
-        self.details.configure(state="normal")
-        self.details.delete("1.0", "end")
-        self.details.insert("1.0", text)
-        self.details.configure(state="disabled")
+        if NO_ATTEMPT_COUNTS_AS_ROUND:
+            # count as 0% round
+            self.rounds_done += 1
+            self.score_sum += 0.0
+            self._update_progress()
+            self._advance_or_finish()
 
-    # ---------- Audio (STT) ----------
-    def _listen_google_en(self) -> str:
-        """
-        Listen and transcribe with Google (needs internet).
-        Controlled by .env: AMBIENT_DURATION, LISTEN_TIME_LIMIT
-        """
-        with sr.Microphone() as source:
-            self.recognizer.adjust_for_ambient_noise(source, duration=AMBIENT_DURATION)
-            audio = self.recognizer.listen(source, phrase_time_limit=LISTEN_TIME_LIMIT)
-
-        return self.recognizer.recognize_google(audio, language="en-US").lower()
-
-    def _disable_buttons(self, disabled: bool):
-        state = "disabled" if disabled else "normal"
-        self.btn_listen.config(state=state)
-        self.btn_repeat.config(state=state)
-        self.btn_new.config(state=state)
-        self.btn_reset.config(state=state)
-        self.btn_speak.config(state=state)
-
-    def repeat_listen_no_score(self):
-        """
-        Listen and show transcript, but do not count a round nor score.
-        """
-        self._disable_buttons(True)
-        self.status_var.set("🎙️ Escuchando (repetir, no cuenta)...")
-        self.update_idletasks()
-
-        try:
-            raw_text = self._listen_google_en()
-        except sr.UnknownValueError:
-            self.status_var.set("🤷 No pude entender el audio. Repite más despacio.")
-            self._disable_buttons(False)
-            return
-        except sr.RequestError as e:
-            messagebox.showerror("Error reconocimiento", f"Error del servicio de reconocimiento:\n{e}")
-            self.status_var.set("🌐 Error del servicio de reconocimiento.")
-            self._disable_buttons(False)
-            return
-        except Exception as e:
-            messagebox.showerror("Error", f"Ocurrió un error:\n{e}")
-            self.status_var.set("❌ Error inesperado.")
-            self._disable_buttons(False)
-            return
-
-        normalized = normalize_letters(raw_text)
-        self.raw_var.set(f"Heard (raw): {raw_text}")
-        self.norm_var.set(f"Heard (letters): {normalized if normalized else '(vacío)'}")
-        self.summary_var.set("Accuracy: - (no cuenta)")
-        self.status_var.set("🔁 Repetición mostrada (no cuenta). Pulsa 🎙️ Escuchar para evaluar.")
-
-        if SHOW_DETAILS:
-            self._set_details("Repetición sin evaluación.\nPulsa 🎙️ Escuchar para evaluar este intento.")
-        else:
-            self._set_details("")
-
-        self._disable_buttons(False)
-
-    def listen_and_check(self):
-        if not self.current_word:
-            self.new_round()
-
-        self._disable_buttons(True)
-        self.status_var.set("🎙️ Escuchando... (habla ahora)")
-        self.update_idletasks()
-
-        try:
-            raw_text = self._listen_google_en()
-        except sr.UnknownValueError:
-            self.status_var.set("🤷 No pude entender el audio. Prueba otra vez.")
-            self._disable_buttons(False)
-            return
-        except sr.RequestError as e:
-            messagebox.showerror("Error reconocimiento", f"Error del servicio de reconocimiento:\n{e}")
-            self.status_var.set("🌐 Error del servicio de reconocimiento.")
-            self._disable_buttons(False)
-            return
-        except Exception as e:
-            messagebox.showerror("Error", f"Ocurrió un error:\n{e}")
-            self.status_var.set("❌ Error inesperado.")
-            self._disable_buttons(False)
-            return
-
-        normalized = normalize_letters(raw_text)
+    def _handle_attempt(self, raw_text: str, letters: str):
+        # Called in UI thread (via after)
+        self._disable_controls(False)
 
         self.raw_var.set(f"Heard (raw): {raw_text}")
-        self.norm_var.set(f"Heard (letters): {normalized if normalized else '(vacío)'}")
+        self.norm_var.set(f"Heard (letters): {letters}")
 
-        # Scoring
-        if SCORING_MODE != "position":
-            result = score_positionwise(self.current_word, normalized)
-        else:
-            result = score_positionwise(self.current_word, normalized)
-
+        result = score_positionwise(self.current_word, letters)
         self.summary_var.set(
-            f"Accuracy: {result['accuracy']:.1f}%  "
-            f"({result['correct_positions']}/{result['denom']} posiciones)"
+            f"Accuracy: {result['accuracy']:.1f}%  ({result['correct_positions']}/{result['denom']} posiciones)"
         )
 
         if result["exact"]:
@@ -468,35 +447,36 @@ class SpellingBeeApp(tk.Tk):
             self.status_var.set(msg)
 
         if SHOW_DETAILS:
-            details_lines = []
-            details_lines.append(f"Target : {result['target']}")
-            details_lines.append(f"Guess  : {result['guess']}")
-            details_lines.append("")
-            details_lines.append("Pos | expected | got | ok")
-            details_lines.append("-" * 26)
+            lines = [
+                f"Target : {result['target']}",
+                f"Guess  : {result['guess']}",
+                "",
+                "Pos | expected | got | ok",
+                "-" * 26,
+            ]
             for i, tc, gc, ok in result["per_pos"]:
                 tc_disp = tc if tc is not None else "∅"
                 gc_disp = gc if gc is not None else "∅"
                 mark = "✓" if ok else "x"
-                details_lines.append(f"{i:02d}  |   {tc_disp}      |  {gc_disp}  | {mark}")
-            self._set_details("\n".join(details_lines))
-        else:
-            self._set_details("")
+                lines.append(f"{i:02d}  |   {tc_disp}      |  {gc_disp}  | {mark}")
+            self._set_details("\n".join(lines))
 
-        # Global score
+        # update global
         self.rounds_done += 1
         self.score_sum += float(result["accuracy"])
         self._update_progress()
+        self._advance_or_finish()
 
+    def _advance_or_finish(self):
         total = int(self.rounds_total.get())
         if self.rounds_done >= total:
             self.finish_game(auto=True)
         else:
             self.new_round()
 
-        self._disable_buttons(False)
-
     def finish_game(self, auto: bool = False):
+        self._stop_listening.set()
+
         total = int(self.rounds_total.get())
         if self.rounds_done == 0:
             messagebox.showinfo("Resultado", "Aún no has completado ninguna ronda.")
